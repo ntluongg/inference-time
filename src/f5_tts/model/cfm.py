@@ -417,30 +417,38 @@ class CFM_SDE(CFM):
         return x
 
 
-    # @torch.no_grad()
-    # def sample(self, *args, **kwargs):
+    def reward(self, x0, ref_audio_len):
+        import requests
+        import torch
 
-    #     if self.sample_method == "ode":
-    #         return super().sample(*args, **kwargs)
+        if x0.dim() == 2:
+            x0 = x0.unsqueeze(0)
 
-    #     # monkey patch odeint
-    #     original_odeint = odeint
+        B = x0.size(0)
+        device = x0.device
 
-    #     def fake_odeint(fn, y0, t, **_):
-    #         final = self.integrate(fn, y0, t)
-    #         return torch.stack([y0, final])
+        rewards = []
 
-    #     globals()["odeint"] = fake_odeint
+        for i in range(B):
 
-    #     out = super().sample(*args, **kwargs)
+            mel = x0[i].detach().cpu().float().tolist()
 
-    #     globals()["odeint"] = original_odeint
+            response = requests.post(
+                "http://localhost:8000/infer",
+                json={
+                    "mel": mel,
+                    "ref_len": ref_audio_len 
+                },
+                timeout=10,
+            )
 
-    #     return out
+            if response.status_code != 200:
+                raise RuntimeError(response.text)
 
-    def reward(self, x0):
-        # placeholder bro
-        return random.randint(1, 5)
+            mos = response.json()["mos"]
+            rewards.append(mos)
+
+        return torch.tensor(rewards, device=device, dtype=x0.dtype)
 
 
     # Single stochastic denoise step
@@ -481,6 +489,7 @@ class CFM_SDE(CFM):
             cond = cond.permute(0, 2, 1)
             assert cond.shape[-1] == self.num_channels
 
+        ref_len = cond.shape[-1] // 256
         cond = cond.to(next(self.parameters()).dtype)
 
         batch, cond_seq_len, device = *cond.shape[:2], cond.device
@@ -556,13 +565,11 @@ class CFM_SDE(CFM):
                 pred, null_pred = torch.chunk(pred_cfg, 2, dim=0)
                 v = pred + (pred - null_pred) * cfg_strength
 
-            print("t:", t.item() if torch.numel(t) == 1 else t)
+            print("time t:", t.item() if torch.numel(t) == 1 else t)
             print("mean|x|", x.abs().mean().item())
             print("mean|v|", v.abs().mean().item())
 
             return v
-
-
 
         y0 = []
         for dur in duration:
@@ -602,7 +609,7 @@ class CFM_SDE(CFM):
         #  RBF 
 
         x_s = y0
-        r_star = random.randint(1, 5)
+        r_star = self.reward(x_s, ref_len)
 
         M = len(t) - 1
         Q = [2] * M  # quota per step
@@ -643,7 +650,7 @@ class CFM_SDE(CFM):
                         torch.clamp(dt, min=1e-8)
                     ) * noise
 
-                r_candidate = random.randint(1, 5)
+                r_candidate = self.reward(x_candidate, ref_len)
 
                 if r_candidate > r_star:
 
@@ -667,11 +674,12 @@ class CFM_SDE(CFM):
 
         self.transformer.clear_cache()
 
-        sampled = trajectory[-1]
-        out = torch.where(cond_mask, cond, sampled)
 
+        sampled = trajectory[-1]
+        print("sampled", sampled.shape)
+        out = torch.where(cond_mask, cond, sampled)
+        print("out", out.shape)
         if vocoder is not None:
             out = out.permute(0, 2, 1)
             out = vocoder(out)
-
         return out, trajectory
