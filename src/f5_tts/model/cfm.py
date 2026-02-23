@@ -186,9 +186,9 @@ class CFM(nn.Module):
                 v = pred + (pred - null_pred) * cfg_strength
 
             # DEBUG
-            print("t:", t.item() if torch.numel(t)==1 else t)
-            print("mean|x|", x.abs().mean().item())
-            print("mean|v|", v.abs().mean().item())
+            # print("t:", t.item() if torch.numel(t)==1 else t)
+            # print("mean|x|", x.abs().mean().item())
+            # print("mean|v|", v.abs().mean().item())
 
             return v
 
@@ -203,7 +203,8 @@ class CFM(nn.Module):
         y0 = pad_sequence(y0, padding_value=0, batch_first=True)
 
         t_start = 0
-
+        # use_epss=True
+        print("???", use_epss, t_start)
         # duplicate test corner for inner time step oberservation
         if duplicate_test:
             t_start = t_inter
@@ -219,7 +220,6 @@ class CFM(nn.Module):
 
         trajectory = odeint(fn, y0, t, **self.odeint_kwargs)
         self.transformer.clear_cache()
-
         sampled = trajectory[-1]
         out = sampled
         out = torch.where(cond_mask, cond, out)
@@ -351,70 +351,16 @@ class CFM_SDE(CFM):
             return torch.zeros_like(t)
 
         if self.diffusion_schedule == "linear":
-            return self.diffusion_norm * t
+            return self.diffusion_norm * (1-t)
 
         if self.diffusion_schedule == "square":
-            return self.diffusion_norm * (t ** 2)
+            return self.diffusion_norm * ((1-t) ** 2)
 
         if self.diffusion_schedule == "constant":
             return torch.ones_like(t) * self.diffusion_norm
 
         raise ValueError
 
-
-    def integrate(self, fn, y0, t):
-
-        x = y0
-
-        for i in range(len(t) - 1):
-
-            t_curr = t[i]
-            t_next = t[i + 1]
-            dt = t_next - t_curr
-
-            velocity = fn(t_curr, x)
-
-            print(f"\nStep {i}")
-            print("mean|v|", velocity.abs().mean().item())
-
-            drift = velocity
-
-            if self.sample_method == "sde":
-
-                score = self.convert_velocity_to_score(
-                    velocity,
-                    t_curr,
-                    x,
-                )
-
-                print("mean|score|", score.abs().mean().item())
-
-                g = self.get_diffuse(t_curr)
-                while g.ndim < x.ndim:
-                    g = g.unsqueeze(-1)
-
-                drift = velocity - 0.5 * (g ** 2) * score
-
-            print("mean|drift|", drift.abs().mean().item())
-
-            while dt.ndim < x.ndim:
-                dt = dt.unsqueeze(-1)
-
-            x = x + drift * dt
-
-            print("mean|x|", x.abs().mean().item())
-
-
-            if self.sample_method == "sde":
-                g = self.get_diffuse(t_curr)
-                while g.ndim < x.ndim:
-                    g = g.unsqueeze(-1)
-
-                noise = torch.randn_like(x)
-                x = x + g * torch.sqrt(torch.clamp(dt, min=1e-8)) * noise
-                
-
-        return x
 
 
     def reward(self, x0, ref_audio_len):
@@ -451,15 +397,6 @@ class CFM_SDE(CFM):
         return torch.tensor(rewards, device=device, dtype=x0.dtype)
 
 
-    # Single stochastic denoise step
-    def stoch_denoise(self, fn, x, s, s_next):
-        """
-        Perform one stochastic denoising step from time s to s_next.
-        """
-        t = torch.tensor([s, s_next], device=x.device, dtype=x.dtype)
-        out = self.integrate(fn, x, t)
-        return out
-
     @torch.no_grad()
     def sample(
         self,
@@ -468,7 +405,7 @@ class CFM_SDE(CFM):
         duration,
         *,
         lens=None,
-        steps=32,
+        steps=8,
         cfg_strength=1.0,
         sway_sampling_coef=None,
         seed=None,
@@ -482,7 +419,7 @@ class CFM_SDE(CFM):
     ):
 
         self.eval()
-
+        # steps=8
 
         if cond.ndim == 2:
             cond = self.mel_spec(cond)
@@ -565,9 +502,9 @@ class CFM_SDE(CFM):
                 pred, null_pred = torch.chunk(pred_cfg, 2, dim=0)
                 v = pred + (pred - null_pred) * cfg_strength
 
-            print("time t:", t.item() if torch.numel(t) == 1 else t)
-            print("mean|x|", x.abs().mean().item())
-            print("mean|v|", v.abs().mean().item())
+            # print("time t:", t.item() if torch.numel(t) == 1 else t)
+            # print("mean|x|", x.abs().mean().item())
+            # print("mean|v|", v.abs().mean().item())
 
             return v
 
@@ -594,6 +531,7 @@ class CFM_SDE(CFM):
             t = get_epss_timesteps(
                 steps, device=device, dtype=step_cond.dtype
             )
+            print("EPSS", t)
         else:
             t = torch.linspace(
                 t_start, 1, steps + 1,
@@ -612,7 +550,8 @@ class CFM_SDE(CFM):
         r_star = self.reward(x_s, ref_len)
 
         M = len(t) - 1
-        Q = [2] * M  # quota per step
+        branch_num = 4
+        Q = [branch_num] * M  # quota per step
 
         trajectory = [x_s]
 
@@ -651,7 +590,7 @@ class CFM_SDE(CFM):
                     ) * noise
 
                 r_candidate = self.reward(x_candidate, ref_len)
-
+                print(f"Step {i} - Particle {j} - Reward:", r_candidate.item())
                 if r_candidate > r_star:
 
                     if i + 1 < M:
