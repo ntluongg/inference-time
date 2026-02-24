@@ -28,8 +28,7 @@ from f5_tts.model.utils import (
     list_str_to_tensor,
     mask_from_frac_lengths,
 )
-
-import math
+import requests
 
 class CFM(nn.Module):
     def __init__(
@@ -364,8 +363,7 @@ class CFM_SDE(CFM):
 
 
     def reward(self, x0, ref_audio_len):
-        import requests
-        import torch
+
 
         if x0.dim() == 2:
             x0 = x0.unsqueeze(0)
@@ -564,11 +562,10 @@ class CFM_SDE(CFM):
 
             best_local_reward = -1
             best_local_sample = None
-
+            v = fn(s, x_s)
             for j in range(1, q + 1):
 
-                v = fn(s, x_s)
-
+        
                 drift = v
 
                 if self.sample_method == "sde":
@@ -589,7 +586,9 @@ class CFM_SDE(CFM):
                         torch.clamp(dt, min=1e-8)
                     ) * noise
 
-                r_candidate = self.reward(x_candidate, ref_len)
+                x_pred = x_candidate + (1-s_next) * fn(s_next, x_candidate)
+                
+                r_candidate = self.reward(x_pred, ref_len)
                 print(f"Step {i} - Particle {j} - Reward:", r_candidate.item())
                 if r_candidate > r_star:
 
@@ -612,7 +611,6 @@ class CFM_SDE(CFM):
         trajectory = torch.stack(trajectory, dim=0)
 
         self.transformer.clear_cache()
-
 
         sampled = trajectory[-1]
         print("sampled", sampled.shape)
