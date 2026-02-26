@@ -29,6 +29,7 @@ from f5_tts.model.utils import (
     mask_from_frac_lengths,
 )
 import requests
+from reward import LocalMOSPipeline
 
 class CFM(nn.Module):
     def __init__(
@@ -75,9 +76,35 @@ class CFM(nn.Module):
         # vocab map for tokenization
         self.vocab_char_map = vocab_char_map
 
+        # load MOS model once
+        self.mos_pipeline = LocalMOSPipeline(device="cuda")
+
     @property
     def device(self):
         return next(self.parameters()).device
+
+    @torch.no_grad()
+    def reward(self, x0, ref_audio_len, cond_mask, cond):
+        """
+        x0: (B, T, C)
+        return: (B,)
+        """
+        x0 = torch.where(cond_mask, cond, x0)
+        if x0.dim() == 2:
+            x0 = x0.unsqueeze(0)
+
+        device = x0.device
+        dtype = x0.dtype
+
+        # detach vì reward không cần gradient
+        x0 = x0.detach()
+
+        mos = self.mos_pipeline.infer_from_mel(
+            x0,
+            ref_len=ref_audio_len
+        )  # (B,)
+
+        return mos.to(device=device, dtype=dtype)
 
     @torch.no_grad()
     def sample(
@@ -102,10 +129,14 @@ class CFM(nn.Module):
         self.eval()
         # raw wave
 
+        ref_len = cond.shape[-1] // 256
+        print("ref_len for reward:", ref_len)
         if cond.ndim == 2:
             cond = self.mel_spec(cond)
             cond = cond.permute(0, 2, 1)
             assert cond.shape[-1] == self.num_channels
+
+        
 
         cond = cond.to(next(self.parameters()).dtype)
 
@@ -203,7 +234,7 @@ class CFM(nn.Module):
 
         t_start = 0
         # use_epss=True
-        print("???", use_epss, t_start)
+        # print("???", use_epss, t_start)
         # duplicate test corner for inner time step oberservation
         if duplicate_test:
             t_start = t_inter
@@ -227,8 +258,11 @@ class CFM(nn.Module):
             out = out.permute(0, 2, 1)
             out = vocoder(out)
 
-        # print(trajectory.shape)
+        print(trajectory.shape)
         # print("debug", trajectory)
+        for i in range(trajectory.shape[0]):
+            print(f"Step {i} - Reward:", self.reward(trajectory[i], ref_len, cond_mask, cond).item())
+
         return out, trajectory
 
     def forward(
@@ -312,7 +346,7 @@ class CFM_SDE(CFM):
         *args,
         sample_method="sde",      # "sde" | "ode"
         diffusion_norm=0.03,
-        diffusion_schedule="linear",
+        diffusion_schedule="square",
         **kwargs,
     ):
         super().__init__(*args, **kwargs)
@@ -362,37 +396,38 @@ class CFM_SDE(CFM):
 
 
 
-    def reward(self, x0, ref_audio_len):
+    # def reward(self, x0, ref_audio_len):
 
 
-        if x0.dim() == 2:
-            x0 = x0.unsqueeze(0)
+    #     if x0.dim() == 2:
+    #         x0 = x0.unsqueeze(0)
 
-        B = x0.size(0)
-        device = x0.device
+    #     B = x0.size(0)
+    #     device = x0.device
 
-        rewards = []
+    #     rewards = []
 
-        for i in range(B):
+    #     for i in range(B):
 
-            mel = x0[i].detach().cpu().float().tolist()
+    #         mel = x0[i].detach().cpu().float().tolist()
 
-            response = requests.post(
-                "http://localhost:8000/infer",
-                json={
-                    "mel": mel,
-                    "ref_len": ref_audio_len 
-                },
-                timeout=10,
-            )
+    #         response = requests.post(
+    #             "http://localhost:8000/infer",
+    #             json={
+    #                 "mel": mel,
+    #                 "ref_len": ref_audio_len 
+    #             },
+    #             timeout=10,
+    #         )
 
-            if response.status_code != 200:
-                raise RuntimeError(response.text)
+    #         if response.status_code != 200:
+    #             raise RuntimeError(response.text)
 
-            mos = response.json()["mos"]
-            rewards.append(mos)
+    #         mos = response.json()["mos"]
+    #         rewards.append(mos)
 
-        return torch.tensor(rewards, device=device, dtype=x0.dtype)
+    #     return torch.tensor(rewards, device=device, dtype=x0.dtype)
+
 
 
     @torch.no_grad()
@@ -545,7 +580,7 @@ class CFM_SDE(CFM):
         #  RBF 
 
         x_s = y0
-        r_star = self.reward(x_s, ref_len)
+        r_star = self.reward(x_s, ref_len, cond_mask, cond)
 
         M = len(t) - 1
         branch_num = 4
@@ -565,7 +600,6 @@ class CFM_SDE(CFM):
             v = fn(s, x_s)
             for j in range(1, q + 1):
 
-        
                 drift = v
 
                 if self.sample_method == "sde":
@@ -586,9 +620,9 @@ class CFM_SDE(CFM):
                         torch.clamp(dt, min=1e-8)
                     ) * noise
 
-                x_pred = x_candidate + (1-s_next) * fn(s_next, x_candidate)
+                # x_pred = x_candidate + (1-s_next) * fn(s_next, x_candidate)
                 
-                r_candidate = self.reward(x_pred, ref_len)
+                r_candidate = self.reward(x_candidate, ref_len, cond_mask, cond)
                 print(f"Step {i} - Particle {j} - Reward:", r_candidate.item())
                 if r_candidate > r_star:
 
@@ -600,11 +634,12 @@ class CFM_SDE(CFM):
                     break
 
                 if r_candidate > best_local_reward:
-                    best_local_reward = r_candidate
+                    best_local_reward = r_candidate.item()
                     best_local_sample = x_candidate
 
                 if j == q:
                     x_s = best_local_sample
+            print(f"Step {i} - Best Local Reward: {best_local_reward}")
 
             trajectory.append(x_s)
 
@@ -613,10 +648,11 @@ class CFM_SDE(CFM):
         self.transformer.clear_cache()
 
         sampled = trajectory[-1]
-        print("sampled", sampled.shape)
+        print("sampled", self.reward(sampled, ref_len, cond_mask, cond).item())
         out = torch.where(cond_mask, cond, sampled)
         print("out", out.shape)
         if vocoder is not None:
             out = out.permute(0, 2, 1)
             out = vocoder(out)
+        print("final reward on out:",self.reward(out, ref_len, cond_mask, cond).item())
         return out, trajectory
